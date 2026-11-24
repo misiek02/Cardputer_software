@@ -36,6 +36,8 @@ h1{font-size:17px;letter-spacing:.08em;margin:0;flex:1}
 .tag{font-weight:700;color:var(--bg);background:var(--idle);border-radius:5px;padding:1px 7px}
 .sel .tag,.linked .tag{background:var(--acc)}
 .ch .us{margin-left:auto}
+.ch .typ{font-weight:700;color:var(--acc);display:none}
+.cont .ch .typ{display:inline}
 svg.dial{display:block;width:100%;max-height:44vh;touch-action:none;cursor:grab;user-select:none;-webkit-user-select:none}
 svg.dial.drag{cursor:grabbing}
 .deg{font:700 26px/1 system-ui,sans-serif;fill:var(--text)}
@@ -55,6 +57,9 @@ button.warn{background:var(--bad);color:#fff}
 details{margin-top:10px;background:var(--panel);border-radius:var(--r);padding:0 12px}
 summary{padding:12px 0;cursor:pointer;color:var(--dim);font-weight:600}
 .set{display:grid;gap:10px;padding-bottom:14px}
+.trim{display:flex;align-items:center;gap:10px}.trim>span{width:70px;color:var(--dim);font-size:14px}
+.trim output{flex:1;text-align:center;font-weight:600}
+.trim button{flex:0 0 64px}
 .set h3{margin:6px 0 0;font-size:13px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
 label{display:flex;align-items:center;gap:10px}
 label>span{width:70px;color:var(--dim);font-size:14px}
@@ -96,12 +101,19 @@ kbd{background:var(--track);border-radius:4px;padding:0 5px;font:12px ui-monospa
   <label><span>Serwo 1</span><select id="pin0"></select></label>
   <label><span>Serwo 2</span><select id="pin1"></select></label>
   <div class="btns"><button id="bPins">Zapisz piny</button></div>
-  <h3>Sie&#263; domowa</h3>
+  <h3>Typ serwa</h3>
+  <label><span>Serwo 1</span><select id="typ0"><option value="0">180&deg; &ndash; ustawia k&#261;t</option><option value="1">360&deg; &ndash; ci&#261;g&#322;e obroty (pr&#281;dko&#347;&#263;)</option></select></label>
+  <div class="trim" id="trimRow0"><span>Trim S1</span><button data-tr="0" data-d="-5">&minus;5</button><output id="trim0">0 &micro;s</output><button data-tr="0" data-d="5">+5</button></div>
+  <label><span>Serwo 2</span><select id="typ1"><option value="0">180&deg; &ndash; ustawia k&#261;t</option><option value="1">360&deg; &ndash; ci&#261;g&#322;e obroty (pr&#281;dko&#347;&#263;)</option></select></label>
+  <div class="trim" id="trimRow1"><span>Trim S2</span><button data-tr="1" data-d="-5">&minus;5</button><output id="trim1">0 &micro;s</output><button data-tr="1" data-d="5">+5</button></div>
+  <div class="note">Serwo 360&deg; nie trzyma k&#261;ta: &bdquo;90&deg;&rdquo; to STOP, odchylenie w lewo/prawo to kierunek i pr&#281;dko&#347;&#263;. Je&#347;li na STOP wolno si&#281; kr&#281;ci, popraw trim.</div>
+  <h3>Sie&#263; Wi-Fi</h3>
   <div class="note" id="staInfo">&ndash;</div>
+  <label><span>Tryb</span><select id="mode"><option value="0">W&#322;asna sie&#263; Cardputera (+ opcjonalnie istniej&#261;ca)</option><option value="1">Tylko istniej&#261;ca sie&#263; (bez w&#322;asnej)</option></select></label>
   <label><span>SSID</span><input id="ssid" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
   <label><span>Has&#322;o</span><input id="pass" type="password" autocomplete="off"></label>
-  <div class="btns"><button id="bWifi">Po&#322;&#261;cz</button><button id="bForget" class="warn">Zapomnij</button></div>
-  <div class="note">Cardputer zawsze trzyma te&#380; w&#322;asn&#261; sie&#263; (<b id="apName"></b>). Po po&#322;&#261;czeniu z sieci&#261; domow&#261; adres IP pojawi si&#281; na ekranie Wi-Fi (klawisz <kbd>w</kbd>) i tutaj.</div>
+  <div class="btns"><button id="bWifi">Zapisz i po&#322;&#261;cz</button><button id="bForget" class="warn">Zapomnij</button></div>
+  <div class="note">W&#322;asna sie&#263;: <b id="apName"></b>. W trybie &bdquo;tylko istniej&#261;ca sie&#263;&rdquo; Cardputer wy&#322;&#261;cza swoj&#261; sie&#263; &ndash; stron&#281; otworzysz pod adresem IP z ekranu Wi-Fi (klawisz <kbd>w</kbd>) lub http://servo.local/. Sie&#263; mo&#380;na te&#380; wybra&#263; na Cardputerze: <kbd>w</kbd>, potem <kbd>n</kbd>.</div>
  </div>
 </details>
 
@@ -115,7 +127,7 @@ Kó&#322;ko myszy nad tarcz&#261; = &plusmn;1&deg; (z <kbd>Shift</kbd> = krok).<
 "use strict";
 const STEPS=[1,5,15,45], SPEED=500; // st./s, jak symulacja na Cardputerze
 const $=s=>document.querySelector(s);
-let S={t:[90,90],o:1,l:0,d:0,s:0,k:1,g:[1,2]};  // stan z urzadzenia
+let S={t:[90,90],o:1,l:0,d:0,s:0,k:1,g:[1,2],c:[0,0],r:[0,0]};  // stan z urzadzenia
 const sim=[90,90], drag=[null,null], pend=[null,null];
 let ws=null, online=false, pins=[];
 
@@ -127,7 +139,7 @@ function el(tag,attrs,parent){const e=document.createElementNS(NS,tag);for(const
 
 const D=[0,1].map(i=>{
  const card=document.createElement("div");card.className="card";
- card.innerHTML=`<div class="ch"><span class="tag">S${i+1}</span><span class="pin"></span><span class="us"></span></div>`;
+ card.innerHTML=`<div class="ch"><span class="tag">S${i+1}</span><span class="typ">360&deg;</span><span class="pin"></span><span class="us"></span></div>`;
  const svg=el("svg",{viewBox:"0 0 220 "+VH,class:"dial"},card);
  el("path",{d:arc(R,0,180),stroke:"#283042","stroke-width":16,fill:"none","stroke-linecap":"round"},svg);
  const fill=el("path",{stroke:"#ff961e","stroke-width":16,fill:"none","stroke-linecap":"round"},svg);
@@ -157,7 +169,7 @@ const D=[0,1].map(i=>{
   const d=(e.deltaY<0||e.deltaX>0?1:-1)*(e.shiftKey?STEPS[S.k]:1);setAngle(i,S.t[i]+d)},{passive:false});
  row.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;select(i);buzz();
   if(b.dataset.a!==undefined)setAngle(i,+b.dataset.a);else setAngle(i,S.t[i]+(+b.dataset.m)*STEPS[S.k])});
- return{card,fill,arm,dot,deg,pin:card.querySelector(".pin"),us:card.querySelector(".us")};
+ return{card,fill,arm,dot,deg,pin:card.querySelector(".pin"),us:card.querySelector(".us"),btn:row.querySelectorAll("button")};
 });
 
 // ---------- akcje ----------
@@ -200,13 +212,19 @@ addEventListener("keydown",e=>{
  e.preventDefault()});
 
 // ---------- rysowanie ----------
+const BTN180=["0°","−","90°","+","180°"], BTN360=["◀ max","−","STOP","+","max ▶"];
+function usOf(i){return S.c[i]?Math.round(1500+S.r[i]+(S.t[i]-90)*500/90):Math.round(500+1900*S.t[i]/180)}
+function speed(t){const p=Math.trunc((t-90)*100/90);return p?(p>0?"+":"")+p+"%":"STOP"}
 function render(){
- for(let i=0;i<2;i++){const d=D[i],act=S.l||S.s===i,on=!!S.o;
-  d.card.classList.toggle("sel",act);d.card.classList.toggle("off",!on);
+ for(let i=0;i<2;i++){const d=D[i],act=S.l||S.s===i,on=!!S.o,c=!!S.c[i];
+  d.card.classList.toggle("sel",act);d.card.classList.toggle("off",!on);d.card.classList.toggle("cont",c);
+  d.btn.forEach((b,k)=>b.textContent=(c?BTN360:BTN180)[k]);
+  const ty=$("#typ"+i);if(document.activeElement!==ty)ty.value=c?1:0;
+  $("#trimRow"+i).style.display=c?"":"none";$("#trim"+i).textContent=(S.r[i]>0?"+":"")+S.r[i]+" µs";
   d.fill.setAttribute("stroke",on?(act?"#ff961e":"#5aa0e6"):"#5a5a64");
   const g=pins.find(p=>p[0]===S.g[i]);
   d.pin.textContent="G"+S.g[i]+(g?" · "+g[1]:"");
-  d.us.textContent=(on?Math.round(500+1900*S.t[i]/180):0)+" µs"}
+  d.us.textContent=(on?usOf(i):0)+" µs"}
  $("#bLink").classList.toggle("on",!!S.l);$("#bDemo").classList.toggle("on",!!S.d);
  $("#bPwm").classList.toggle("on",!!S.o);$("#bPwm").textContent=S.o?"PWM ON":"PWM OFF";
  const p=$("#pwm");p.textContent=S.o?"PWM ON":"PWM OFF";p.className="pill "+(S.o?"ok":"bad");
@@ -215,12 +233,14 @@ function render(){
 let last=performance.now();
 function frame(now){const dt=Math.min(.1,(now-last)/1000);last=now;
  for(let i=0;i<2;i++){const d=D[i];
-  if(S.o){const diff=S.t[i]-sim[i],st=SPEED*dt;sim[i]=Math.abs(diff)<=st?S.t[i]:sim[i]+Math.sign(diff)*st}
-  d.fill.setAttribute("d",sim[i]>.5?arc(R,0,sim[i]):"");
+  const c=!!S.c[i];
+  if(c)sim[i]=S.t[i]; // serwo 360: wskazowka predkosci bez opoznienia
+  else if(S.o){const diff=S.t[i]-sim[i],st=SPEED*dt;sim[i]=Math.abs(diff)<=st?S.t[i]:sim[i]+Math.sign(diff)*st}
+  d.fill.setAttribute("d",c?(Math.abs(sim[i]-90)>.5?arc(R,Math.min(90,sim[i]),Math.max(90,sim[i])):""):(sim[i]>.5?arc(R,0,sim[i]):""));
   d.arm.setAttribute("transform",`translate(${CX} ${CY}) rotate(${sim[i]-180})`);
   const[x,y]=pt(R,S.t[i]);d.dot.setAttribute("cx",x);d.dot.setAttribute("cy",y);
   d.dot.style.display=Math.abs(S.t[i]-sim[i])>.5?"":"none";
-  d.deg.textContent=Math.round(sim[i])+"°"}
+  d.deg.textContent=c?speed(S.t[i]):Math.round(sim[i])+"°"}
  requestAnimationFrame(frame)}
 requestAnimationFrame(frame);
 
@@ -233,6 +253,7 @@ function connect(){
  ws.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch(_){return}
   for(let i=0;i<2;i++)if(drag[i]!==null||pend[i]!==null)m.t[i]=S.t[i]; // nie skacz pod palcem
   const pinsChanged=!S.g||m.g[0]!==S.g[0]||m.g[1]!==S.g[1];
+  if(!m.c)m.c=[0,0];if(!m.r)m.r=[0,0];
   S=m;render();if(pinsChanged)fillPins()}}
 // strona wraca z tla na telefonie -> natychmiast ponow polaczenie
 document.addEventListener("visibilitychange",()=>{if(!document.hidden&&ws&&ws.readyState>1)connect()});
@@ -246,13 +267,20 @@ $("#bPins").onclick=()=>{const a=+$("#pin0").value,b=+$("#pin1").value;
 async function info(){try{const j=await(await fetch("/info")).json();
  if(!pins.length){pins=j.pins;fillPins();render()}
  $("#apName").textContent=j.ap;
+ if(document.activeElement!==$("#mode"))$("#mode").value=j.mode||0;
  const st={0:"nie skonfigurowana",1:"łączenie z "+j.ssid+"…",2:"połączono z "+j.ssid+" – http://"+j.ip+"/ (lub http://servo.local/)",3:"nie udało się połączyć z "+j.ssid}[j.sta];
- $("#staInfo").textContent="Status: "+st;
+ $("#staInfo").textContent="Tryb: "+(j.mode?"tylko istniejąca sieć":"własna sieć")+" · status: "+st;
  if(!$("#ssid").value&&j.ssid&&document.activeElement!==$("#ssid"))$("#ssid").value=j.ssid}catch(_){}}
-async function postWifi(ssid,pass){const f=new URLSearchParams({ssid,pass});
+async function postWifi(ssid,pass,mode){const f=new URLSearchParams({ssid,pass,mode});
  try{await fetch("/wifi",{method:"POST",body:f})}catch(_){}setTimeout(info,500)}
-$("#bWifi").onclick=()=>{const s=$("#ssid").value.trim();if(!s){$("#ssid").focus();return}postWifi(s,$("#pass").value)};
-$("#bForget").onclick=()=>{$("#ssid").value="";$("#pass").value="";postWifi("","")};
+$("#bWifi").onclick=()=>{const s=$("#ssid").value.trim();if(!s){$("#ssid").focus();return}
+ const m=$("#mode").value;
+ if(m==="1"&&!confirm("Cardputer wyłączy swoją sieć i połączy się z „"+s+"”. Stronę otworzysz potem pod adresem IP z ekranu Wi-Fi lub http://servo.local/ (będąc w tej samej sieci). Kontynuować?"))return;
+ postWifi(s,$("#pass").value,m)};
+$("#bForget").onclick=()=>{$("#ssid").value="";$("#pass").value="";postWifi("","","0")};
+[0,1].forEach(i=>$("#typ"+i).onchange=e=>{S.c[i]=+e.target.value;S.t[i]=90;send("m "+i+" "+S.c[i]);render()});
+document.querySelectorAll("[data-tr]").forEach(b=>b.onclick=e=>{e.preventDefault();const i=+b.dataset.tr;
+ S.r[i]=Math.max(-200,Math.min(200,S.r[i]+(+b.dataset.d)));send("r "+i+" "+S.r[i]);buzz();render()});
 setInterval(()=>{if($("#settings").open)info()},2000);
 
 render();info();connect();

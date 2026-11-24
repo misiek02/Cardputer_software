@@ -19,13 +19,17 @@
 //   l           tryb "link" - oba serwa ruszaja sie razem
 //   d           tryb demo (sweep tam i z powrotem)
 //   x           wlacz/wylacz sygnal PWM
+//   t           typ wybranego serwa: 180 st. (pozycyjne) / 360 st. (ciagle obroty)
+//   [ ]         trim punktu STOP serwa 360 (-/+ 5 us)
 //   p           konfiguracja pinow
 //   w           Wi-Fi: sterowanie z telefonu / komputera przez przegladarke
 //   h           pomoc
 //
-// Sterowanie przez siec: Cardputer tworzy wlasna siec "ServoCtl-XXXX" (haslo na
-// ekranie Wi-Fi, jest tez kod QR) i serwuje strone http://192.168.4.1/.
-// Opcjonalnie laczy sie tez z siecia domowa (SSID/haslo ustawiasz na stronie).
+// Sterowanie przez siec, dwa tryby (klawisz m na ekranie Wi-Fi):
+//  - wlasna siec: Cardputer tworzy siec "ServoCtl-XXXX" (haslo i QR na ekranie Wi-Fi),
+//    strona http://192.168.4.1/; opcjonalnie laczy sie tez z istniejaca siecia,
+//  - istniejaca siec: tylko klient istniejacej sieci (wybor sieci: klawisz n),
+//    strona pod adresem IP z ekranu Wi-Fi lub http://servo.local/.
 // Strona: src/web_ui.h, komendy WebSocket: handleNetCmd().
 
 #include <M5Cardputer.h>
@@ -33,6 +37,8 @@
 #include <driver/gpio.h>
 #include <driver/ledc.h>
 #include <math.h>
+#include <algorithm>
+#include <vector>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -57,6 +63,11 @@ static constexpr PinOpt PIN_OPTS[] = {
 static constexpr int NUM_PIN_OPTS = sizeof(PIN_OPTS) / sizeof(PIN_OPTS[0]);
 static constexpr int PULSE_MIN_US = 500;      // SG90: ~0.5 ms = 0 st.
 static constexpr int PULSE_MAX_US = 2400;     // SG90: ~2.4 ms = 180 st.
+// serwo 360 (ciagle obroty): 90 = STOP, 0 / 180 = pelna predkosc w lewo / w prawo
+static constexpr int CONT_MID_US = 1500;      // srodek = stop (korekta: trim)
+static constexpr int CONT_SPAN_US = 500;      // 1000..2000 us
+static constexpr int TRIM_MAX_US = 200;
+static constexpr int TRIM_STEP_US = 5;
 static constexpr int PWM_FREQ_HZ = 50;        // okres 20 ms
 static constexpr ledc_timer_bit_t PWM_RES = LEDC_TIMER_14_BIT;
 static constexpr ledc_timer_t PWM_TIMER = LEDC_TIMER_1;  // podswietlenie uzywa innego timera
@@ -80,6 +91,8 @@ static bool outputOn = true;
 static bool showHelp = false;
 static int demoDir = 1;
 static int pinIdx[2] = {0, 1};  // indeksy w PIN_OPTS (domyslnie G1, G2)
+static bool cont[2] = {false, false};  // true = serwo 360 (ciagle obroty)
+static int trimUs[2] = {0, 0};         // korekta punktu STOP serwa 360
 
 // ekran konfiguracji pinow
 static bool pinScreen = false;
@@ -91,6 +104,10 @@ static bool dirty = true;
 
 // siec
 enum StaState { STA_NONE, STA_CONNECTING, STA_OK, STA_FAIL };
+enum NetMode { NET_AP = 0, NET_STA = 1 };  // wlasna siec (+opcjonalnie istniejaca) / tylko istniejaca
+static NetMode netMode = NET_AP;
+static uint32_t restartAt = 0;              // odroczony restart Wi-Fi (zmiana trybu ze strony)
+static constexpr uint32_t STA_RETRY_MS = 5000;
 static bool wifiOn = false;
 static bool wifiScreen = false;
 static bool qrShowsUrl = false;
@@ -104,6 +121,24 @@ static WebServer http(80);
 static WebSocketsServer wsrv(81);
 static DNSServer dns;
 static bool forceBroadcast = false;
+
+// wybor istniejacej sieci na Cardputerze: skan -> lista -> haslo
+enum NetUi { NU_NONE, NU_SCAN, NU_LIST, NU_PASS };
+struct ScanNet {
+  String ssid;
+  int rssi;
+  bool open;
+};
+static NetUi netUi = NU_NONE;
+static std::vector<ScanNet> scanNets;
+static int scanSel = 0;
+static bool scanFailed = false;
+static bool scanStarted = false;
+static uint32_t scanDeadline = 0;
+static constexpr uint32_t SCAN_RETRY_MS = 4000;  // tyle ponawiamy start skanu
+static bool scanTempRadio = false;  // radio wlaczone tylko na czas skanu
+static String passEdit;
+static constexpr int LIST_ROWS = 9;
 
 static M5Canvas canvas(&M5Cardputer.Display);
 
@@ -125,14 +160,20 @@ static void initColors() {
 }
 
 // ---------- serwa ----------
-static int angleToUs(int deg) { return PULSE_MIN_US + (PULSE_MAX_US - PULSE_MIN_US) * deg / 180; }
-
-static uint32_t angleToDuty(int deg) {
-  return (uint32_t)angleToUs(deg) * ((1u << PWM_RES) - 1) / (1000000u / PWM_FREQ_HZ);
+static int angleToUs(int i, int deg) {
+  if (cont[i]) return CONT_MID_US + trimUs[i] + (deg - 90) * CONT_SPAN_US / 90;
+  return PULSE_MIN_US + (PULSE_MAX_US - PULSE_MIN_US) * deg / 180;
 }
 
+static uint32_t angleToDuty(int i, int deg) {
+  return (uint32_t)angleToUs(i, deg) * ((1u << PWM_RES) - 1) / (1000000u / PWM_FREQ_HZ);
+}
+
+// predkosc serwa 360 w procentach (-100..100)
+static int speedPct(int deg) { return (deg - 90) * 100 / 90; }
+
 static void servoWrite(int i) {
-  const uint32_t duty = outputOn ? angleToDuty(target[i]) : 0;
+  const uint32_t duty = outputOn ? angleToDuty(i, target[i]) : 0;
   ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CH[i], duty);
   ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CH[i]);
 }
@@ -152,7 +193,7 @@ static void servoSetup() {
     c.speed_mode = LEDC_LOW_SPEED_MODE;
     c.channel = PWM_CH[i];
     c.timer_sel = PWM_TIMER;
-    c.duty = angleToDuty(target[i]);
+    c.duty = angleToDuty(i, target[i]);
     c.hpoint = 0;
     ledc_channel_config(&c);
   }
@@ -168,6 +209,13 @@ static void loadPins() {
   prefs.begin("servoctl", true);
   const int a = findPinOpt(prefs.getUChar("pin0", 1));
   const int b = findPinOpt(prefs.getUChar("pin1", 2));
+  for (int i = 0; i < 2; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "cont%d", i);
+    cont[i] = prefs.getBool(key, false);
+    snprintf(key, sizeof(key), "trim%d", i);
+    trimUs[i] = constrain(prefs.getShort(key, 0), -TRIM_MAX_US, TRIM_MAX_US);
+  }
   prefs.end();
   if (a >= 0 && b >= 0 && a != b) {
     pinIdx[0] = a;
@@ -182,6 +230,36 @@ static void savePins() {
   prefs.end();
 }
 
+static void saveServoType(int i) {
+  char key[8];
+  prefs.begin("servoctl", false);
+  snprintf(key, sizeof(key), "cont%d", i);
+  prefs.putBool(key, cont[i]);
+  snprintf(key, sizeof(key), "trim%d", i);
+  prefs.putShort(key, trimUs[i]);
+  prefs.end();
+}
+
+// zmiana typu serwa; potem STOP / srodek, zeby serwo 360 nie ruszylo samo
+static void setServoType(int i, bool c) {
+  if (cont[i] == c) return;
+  cont[i] = c;
+  target[i] = 90;
+  simPos[i] = 90;
+  servoWrite(i);
+  saveServoType(i);
+  dirty = true;
+}
+
+static void setTrim(int i, int us) {
+  us = constrain(us, -TRIM_MAX_US, TRIM_MAX_US);
+  if (us == trimUs[i]) return;
+  trimUs[i] = us;
+  servoWrite(i);
+  saveServoType(i);
+  dirty = true;
+}
+
 // przepina kanaly PWM na nowe piny; stare piny wracaja do stanu domyslnego
 static void applyPins(const int newIdx[2]) {
   for (int i = 0; i < 2; i++) {
@@ -194,7 +272,7 @@ static void applyPins(const int newIdx[2]) {
     c.speed_mode = LEDC_LOW_SPEED_MODE;
     c.channel = PWM_CH[i];
     c.timer_sel = PWM_TIMER;
-    c.duty = outputOn ? angleToDuty(target[i]) : 0;
+    c.duty = outputOn ? angleToDuty(i, target[i]) : 0;
     c.hpoint = 0;
     ledc_channel_config(&c);
   }
@@ -232,6 +310,11 @@ static void moveActive(int delta) {
 static void updateSim(float dt) {
   if (!outputOn) return;
   for (int i = 0; i < 2; i++) {
+    if (cont[i]) {  // serwo 360: wskazowka predkosci, bez opoznienia
+      if (simPos[i] != target[i]) dirty = true;
+      simPos[i] = target[i];
+      continue;
+    }
     const float diff = target[i] - simPos[i];
     if (fabsf(diff) < 0.01f) continue;
     const float step = SIM_SPEED_DPS * dt;
@@ -248,6 +331,7 @@ static void loadNet() {
 
   prefs.begin("servoctl", false);
   wifiOn = prefs.getBool("wifi", false);
+  netMode = prefs.getUChar("net_mode", NET_AP) == NET_STA ? NET_STA : NET_AP;
   staSsid = prefs.getString("sta_ssid", "");
   staPass = prefs.getString("sta_pass", "");
   apPass = prefs.getString("ap_pass", "");
@@ -271,6 +355,14 @@ static void staConnect() {
   dirty = true;
 }
 
+static void saveStaCreds(NetMode m) {
+  prefs.begin("servoctl", false);
+  prefs.putString("sta_ssid", staSsid);
+  prefs.putString("sta_pass", staPass);
+  prefs.putUChar("net_mode", m);
+  prefs.end();
+}
+
 static String jsonEscape(const String &in) {
   String out;
   for (char c : in) {
@@ -282,13 +374,15 @@ static String jsonEscape(const String &in) {
 
 static String stateJson() {
   char buf[128];
-  snprintf(buf, sizeof(buf), "{\"t\":[%d,%d],\"o\":%d,\"l\":%d,\"d\":%d,\"s\":%d,\"k\":%d,\"g\":[%d,%d]}",
+  snprintf(buf, sizeof(buf),
+           "{\"t\":[%d,%d],\"o\":%d,\"l\":%d,\"d\":%d,\"s\":%d,\"k\":%d,\"g\":[%d,%d],\"c\":[%d,%d],\"r\":[%d,%d]}",
            target[0], target[1], outputOn, linked, demo, selected, stepIdx, PIN_OPTS[pinIdx[0]].gpio,
-           PIN_OPTS[pinIdx[1]].gpio);
+           PIN_OPTS[pinIdx[1]].gpio, cont[0], cont[1], trimUs[0], trimUs[1]);
   return buf;
 }
 
-// komendy z przegladarki: "a i deg", "b deg", "s i", "k n", "l 0|1", "d 0|1", "x 0|1", "p g1 g2"
+// komendy z przegladarki: "a i deg", "b deg", "s i", "k n", "l 0|1", "d 0|1", "x 0|1", "p g1 g2",
+// "m i 0|1" (typ serwa: 180 / 360), "r i us" (trim serwa 360)
 static void handleNetCmd(const char *msg) {
   int a = 0, b = 0;
   const int n = sscanf(msg + 1, "%d %d", &a, &b);
@@ -326,6 +420,14 @@ static void handleNetCmd(const char *msg) {
       if (pinScreen) closePinMode(false);
       break;
     }
+    case 'm':
+      if (n < 2) return;
+      setServoType(a & 1, b);
+      break;
+    case 'r':
+      if (n < 2) return;
+      setTrim(a & 1, b);
+      break;
     default: return;
   }
   dirty = true;
@@ -352,7 +454,7 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t len) 
 
 static void sendInfo() {
   String j = "{\"ap\":\"" + apSsid + "\",\"ssid\":\"" + jsonEscape(staSsid) + "\",\"sta\":" + String((int)staState) +
-             ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"pins\":[";
+             ",\"mode\":" + String((int)netMode) + ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"pins\":[";
   for (int k = 0; k < NUM_PIN_OPTS; k++) {
     if (k) j += ',';
     j += "[" + String(PIN_OPTS[k].gpio) + ",\"" + PIN_OPTS[k].where + "\"," + (PIN_OPTS[k].sdBus ? "1" : "0") + "]";
@@ -370,12 +472,16 @@ static void setupRoutes() {
   http.on("/wifi", HTTP_POST, [] {
     staSsid = http.arg("ssid");
     staPass = http.arg("pass");
-    prefs.begin("servoctl", false);
-    prefs.putString("sta_ssid", staSsid);
-    prefs.putString("sta_pass", staPass);
-    prefs.end();
+    // tryb "tylko istniejaca siec" wymaga SSID - inaczej Cardputer bylby nieosiagalny
+    const NetMode m = (http.arg("mode") == "1" && !staSsid.isEmpty()) ? NET_STA : NET_AP;
+    saveStaCreds(m);
     http.send(200, "text/plain", "ok");
-    staConnect();
+    if (m != netMode) {
+      netMode = m;
+      restartAt = millis() + 500;  // po wyslaniu odpowiedzi (zmiana trybu zrywa polaczenie)
+    } else {
+      staConnect();
+    }
   });
   // "captive portal": telefon podlaczony do sieci Cardputera sam otwiera strone sterowania
   http.onNotFound([] {
@@ -396,11 +502,17 @@ static void wifiStart() {
     routes = true;
   }
   WiFi.persistent(false);  // dane sieci trzymamy sami w Preferences
-  WiFi.mode(WIFI_AP_STA);
+  if (netMode == NET_AP) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+    WiFi.softAP(apSsid.c_str(), apPass.c_str());
+    dns.start(53, "*", AP_IP);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
   WiFi.setSleep(false);    // mniejsze opoznienia sterowania
-  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(apSsid.c_str(), apPass.c_str());
-  dns.start(53, "*", AP_IP);
+  WiFi.setHostname("servo");
+  WiFi.setAutoReconnect(false);  // ponawianiem zarzadza netLoop (auto-reconnect blokuje skanowanie)
   http.begin();
   wsrv.begin();
   if (MDNS.begin("servo")) MDNS.addService("http", "tcp", 80);
@@ -429,25 +541,153 @@ static void setWifi(bool on) {
   dirty = true;
 }
 
+static void wifiRestart() {
+  if (wifiOn) wifiStop();
+  wifiStart();
+  dirty = true;
+}
+
+static void setNetMode(NetMode m) {
+  if (m == netMode) return;
+  netMode = m;
+  prefs.begin("servoctl", false);
+  prefs.putUChar("net_mode", netMode);
+  prefs.end();
+  if (wifiOn) wifiRestart();
+  dirty = true;
+}
+
+// ---- wybor sieci na Cardputerze ----
+// proba startu skanu; ESP32 odrzuca skan, gdy STA jest w trakcie laczenia
+// albo radio dopiero startuje - wtedy pollScan ponawia probe
+static bool tryStartScan() {
+  WiFi.scanDelete();
+  const int16_t r = WiFi.scanNetworks(true, false);
+  Serial.printf("[scan] start -> %d\n", r);
+  return r != WIFI_SCAN_FAILED;
+}
+
+static void startScan() {
+  if (!wifiOn && !scanTempRadio) {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    scanTempRadio = true;
+  }
+  // przerywamy laczenie (wznawia sie po wyborze sieci / wyjsciu z listy)
+  if (staState != STA_OK) {
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false);
+    if (wifiOn) staState = STA_NONE;
+  }
+  scanStarted = tryStartScan();
+  scanDeadline = millis() + SCAN_RETRY_MS;
+  netUi = NU_SCAN;
+  dirty = true;
+}
+
+static void pollScan() {
+  if (netUi != NU_SCAN) return;
+  static uint32_t lastTry = 0;
+  const uint32_t now = millis();
+  if (!scanStarted) {
+    if ((int32_t)(now - scanDeadline) < 0) {
+      if (now - lastTry < 250) return;
+      lastTry = now;
+      WiFi.disconnect(false);
+      scanStarted = tryStartScan();
+      return;
+    }
+  }
+  const int16_t n = scanStarted ? WiFi.scanComplete() : (int16_t)WIFI_SCAN_FAILED;
+  if (n == WIFI_SCAN_RUNNING) return;
+  if (n == WIFI_SCAN_FAILED && scanStarted && (int32_t)(now - scanDeadline) < 0) {
+    scanStarted = false;  // skan przerwany - jeszcze raz
+    return;
+  }
+  Serial.printf("[scan] wynik %d\n", n);
+  scanNets.clear();
+  scanFailed = n < 0;
+  for (int k = 0; k < n; k++) {
+    const String s = WiFi.SSID(k);
+    if (s.isEmpty()) continue;
+    bool dup = false;
+    for (auto &e : scanNets)
+      if (e.ssid == s) {
+        e.rssi = max(e.rssi, (int)WiFi.RSSI(k));
+        dup = true;
+      }
+    if (!dup) scanNets.push_back({s, WiFi.RSSI(k), WiFi.encryptionType(k) == WIFI_AUTH_OPEN});
+  }
+  WiFi.scanDelete();
+  std::sort(scanNets.begin(), scanNets.end(), [](const ScanNet &a, const ScanNet &b) { return a.rssi > b.rssi; });
+  scanSel = 0;
+  for (int k = 0; k < (int)scanNets.size(); k++)
+    if (scanNets[k].ssid == staSsid) scanSel = k;  // zapamietana siec na poczatku kursora
+  netUi = NU_LIST;
+  dirty = true;
+}
+
+static void closeNetUi() {
+  netUi = NU_NONE;
+  if (scanTempRadio && !wifiOn) WiFi.mode(WIFI_OFF);
+  scanTempRadio = false;
+  if (wifiOn && staState == STA_NONE) staConnect();  // wznow przerwane laczenie
+  dirty = true;
+}
+
+// wybrana siec: zapis, tryb "istniejaca siec" i laczenie
+static void joinNetwork(const String &ssid, const String &pass) {
+  staSsid = ssid;
+  staPass = pass;
+  saveStaCreds(NET_STA);
+  scanTempRadio = false;  // radio zostaje wlaczone - przejmuje je wifiStart
+  netUi = NU_NONE;
+  netMode = NET_STA;
+  if (wifiOn) wifiRestart();
+  else setWifi(true);
+  dirty = true;
+}
+
+static void pickNetwork() {
+  if (scanNets.empty()) return;
+  const ScanNet &e = scanNets[scanSel];
+  if (e.open) {
+    joinNetwork(e.ssid, "");
+    return;
+  }
+  passEdit = e.ssid == staSsid ? staPass : "";
+  netUi = NU_PASS;
+  dirty = true;
+}
+
 static void netLoop() {
+  pollScan();
   if (!wifiOn) return;
-  dns.processNextRequest();
+  const uint32_t now = millis();
+  if (restartAt && (int32_t)(now - restartAt) >= 0) {
+    restartAt = 0;
+    wifiRestart();
+    return;
+  }
+  if (netMode == NET_AP) dns.processNextRequest();
   http.handleClient();
   wsrv.loop();
 
-  const uint32_t now = millis();
+  if (netUi == NU_SCAN) return;  // w trakcie skanu nie ruszamy laczenia
   const bool up = WiFi.status() == WL_CONNECTED;
-  if (staState == STA_CONNECTING && up) {
+  if ((staState == STA_CONNECTING || staState == STA_FAIL) && up) {
     staState = STA_OK;
     dirty = true;
   } else if (staState == STA_CONNECTING && now - staStart > STA_TIMEOUT_MS) {
-    staState = STA_FAIL;  // przestajemy probowac - ciagle skanowanie zakloca siec Cardputera
+    // tryb z wlasna siecia: przestajemy probowac - ciagle skanowanie zakloca siec Cardputera;
+    // tryb "tylko istniejaca siec": ponawiamy co STA_RETRY_MS
+    staState = STA_FAIL;
     WiFi.disconnect(false);
     dirty = true;
+  } else if (staState == STA_FAIL && netMode == NET_STA && now - staStart > STA_TIMEOUT_MS + STA_RETRY_MS) {
+    staConnect();
   } else if (staState == STA_OK && !up) {
-    staState = STA_CONNECTING;
-    staStart = now;
-    dirty = true;
+    staConnect();  // utrata polaczenia - laczymy od nowa (auto-reconnect frameworka wylaczony)
   }
 
   // stan do przegladarek tylko gdy sie zmienil (lub ktos sie podlaczyl)
@@ -491,11 +731,17 @@ static void drawDial(int i, int cx) {
   canvas.drawString(String("G") + PIN_OPTS[pinIdx[i]].gpio, cx - 32, 18);
   canvas.setTextDatum(top_right);
   canvas.setTextColor(C_DIM);
-  canvas.drawString(String(outputOn ? angleToUs(target[i]) : 0) + "us", cx + 56, 18);
+  canvas.drawString(String(outputOn ? angleToUs(i, target[i]) : 0) + "us", cx + 56, 18);
 
   // tor i wypelnienie lukiem (fillArc: 180 = lewo, 270 = gora, 360 = prawo)
+  // serwo 360: luk od srodka (STOP) w strone predkosci
   canvas.fillArc(cx, cy, R - 5, R, 180, 360, C_TRACK);
-  if (simPos[i] > 0.5f) canvas.fillArc(cx, cy, R - 5, R, 180, 180 + simPos[i], acc);
+  if (cont[i]) {
+    const float a = 180 + simPos[i];
+    if (fabsf(simPos[i] - 90) > 0.5f) canvas.fillArc(cx, cy, R - 5, R, min(a, 270.0f), max(a, 270.0f), acc);
+  } else if (simPos[i] > 0.5f) {
+    canvas.fillArc(cx, cy, R - 5, R, 180, 180 + simPos[i], acc);
+  }
 
   // podzialka co 30 st.
   for (int t = 0; t <= 180; t += 30) {
@@ -517,7 +763,7 @@ static void drawDial(int i, int cx) {
   canvas.fillRoundRect(cx - 22, cy - 6, 44, 22, 3, C_BODY);
   canvas.setTextDatum(middle_center);
   canvas.setTextColor(canvas.color565(170, 200, 255));
-  canvas.drawString("SG90", cx, cy + 10);
+  canvas.drawString(cont[i] ? "360" : "SG90", cx, cy + 10);
 
   // orczyk (ramie)
   float ex, ey, bx, by;
@@ -529,10 +775,21 @@ static void drawDial(int i, int cx) {
   canvas.fillCircle(cx, cy, 6, arm);
   canvas.fillCircle(cx, cy, 2, C_BODY);
 
-  // kat
+  // kat (serwo 360: predkosc w % i trim)
   canvas.setFont(&fonts::FreeSansBold9pt7b);
   canvas.setTextDatum(top_center);
   canvas.setTextColor(outputOn ? C_TEXT : C_OFF);
+  if (cont[i]) {
+    const int sp = speedPct(target[i]);
+    canvas.drawString(sp == 0 ? String("STOP") : (sp > 0 ? "+" : "") + String(sp) + "%", cx, 106);
+    if (trimUs[i]) {
+      canvas.setFont(&fonts::Font0);
+      canvas.setTextDatum(top_right);
+      canvas.setTextColor(C_DIM);
+      canvas.drawString("tr" + String(trimUs[i]), cx + 58, 110);
+    }
+    return;
+  }
   const String deg = String((int)lroundf(simPos[i]));
   canvas.drawString(deg, cx, 106);
   canvas.drawCircle(cx + canvas.textWidth(deg) / 2 + 4, 109, 2, outputOn ? C_TEXT : C_OFF);  // znak stopnia
@@ -546,8 +803,8 @@ static void drawHelp() {
   static const char *lines[][2] = {
       {"1 2 TAB", "wybor serwa"},     {", /", "ruch lewo / prawo"},
       {"; .", "krok wiekszy/mniejszy"}, {"c", "oba na 90"},
-      {"0 9", "0 / 180 stopni"},      {"l", "link: oba razem"},
-      {"d", "demo (sweep)"},          {"x", "PWM on/off"},
+      {"0 9", "0 / 180 stopni"},      {"l d", "link (oba razem) / demo"},
+      {"x", "PWM on/off"},            {"t [ ]", "typ 180/360, trim STOP"},
       {"p", "konfiguracja pinow"},    {"w", "Wi-Fi / sterowanie WWW"},
       {"h", "zamknij pomoc"},
   };
@@ -654,83 +911,164 @@ static void drawWifiScreen() {
     canvas.drawString(txt, 4, y);
     y += gap;
   };
+  const char *modeName = netMode == NET_AP ? "wlasna siec" : "istniejaca siec";
 
   if (!wifiOn) {
-    line("Wi-Fi wylaczone.", C_TEXT, 16);
-    line("Po wlaczeniu Cardputer tworzy", C_DIM);
-    line("wlasna siec i strone WWW.", C_DIM);
-    line("Serwami sterujesz wtedy z", C_DIM);
-    line("telefonu, tabletu lub komputera", C_DIM);
-    line("w przegladarce (dotyk, mysz,", C_DIM);
-    line("klawiatura).", C_DIM, 16);
-    line("ENTER - wlacz Wi-Fi", C_ACCENT);
+    line("Wi-Fi wylaczone.", C_TEXT, 13);
+    line(String("Tryb: ") + modeName, C_ACCENT, 13);
+    if (netMode == NET_AP) {
+      line("Cardputer tworzy wlasna siec", C_DIM);
+      line("i strone WWW do sterowania.", C_DIM, 13);
+    } else {
+      line("Cardputer laczy sie z siecia", C_DIM);
+      line(staSsid.isEmpty() ? String("(nie wybrano - klawisz n)") : staSsid.substring(0, 36), C_DIM, 13);
+    }
+    line("ENTER - wlacz Wi-Fi", C_TEXT);
+    line("m     - zmien tryb", C_TEXT);
+    line("n     - wybierz istniejaca siec", C_TEXT);
     return;
   }
 
-  line("Siec Cardputera", C_DIM);
-  line(apSsid, C_TEXT);
-  line("haslo " + apPass, C_TEXT);
-  line(AP_IP.toString(), C_ACCENT, 14);
-  line("Siec domowa", C_DIM);
-  switch (staState) {
-    case STA_NONE: line("ustaw na stronie", C_DIM); line("(Ustawienia)", C_DIM); break;
-    case STA_CONNECTING: line(staSsid.substring(0, 21), C_TEXT); line("laczenie...", C_IDLE); break;
-    case STA_OK: line(staSsid.substring(0, 21), C_TEXT); line(WiFi.localIP().toString(), C_OK); break;
-    case STA_FAIL: line(staSsid.substring(0, 21), C_TEXT); line("brak polaczenia (r)", C_BAD); break;
+  auto staLines = [&]() {
+    switch (staState) {
+      case STA_NONE: line(staSsid.isEmpty() ? "n - wybierz" : "-", C_DIM); break;
+      case STA_CONNECTING: line(staSsid.substring(0, 21), C_TEXT); line("laczenie...", C_IDLE); break;
+      case STA_OK: line(staSsid.substring(0, 21), C_TEXT); line(WiFi.localIP().toString(), C_OK); break;
+      case STA_FAIL:
+        line(staSsid.substring(0, 21), C_TEXT);
+        line(netMode == NET_STA ? "brak, ponawiam..." : "brak polaczenia (r)", C_BAD);
+        break;
+    }
+  };
+
+  String qr;
+  if (netMode == NET_AP) {
+    line("Tryb: wlasna siec", C_DIM);
+    line(apSsid, C_TEXT);
+    line("haslo " + apPass, C_TEXT);
+    line(AP_IP.toString(), C_ACCENT, 14);
+    line("Istniejaca siec", C_DIM);
+    staLines();
+    if (qrShowsUrl) {
+      qr = "http://" + (staState == STA_OK ? WiFi.localIP().toString() : AP_IP.toString()) + "/";
+    } else {
+      qr = "WIFI:T:WPA;S:" + apSsid + ";P:" + apPass + ";;";
+    }
+  } else {
+    line("Tryb: istniejaca siec", C_DIM, 14);
+    staLines();
+    y += 4;
+    line("strona: adres IP", C_DIM);
+    line("lub servo.local", C_DIM);
+    if (staState == STA_OK) qr = "http://" + WiFi.localIP().toString() + "/";
   }
-  y += 4;
+  y = max(y + 4, 106);
   line("przegladarki: " + String(wsrv.connectedClients()), wsrv.connectedClients() ? C_OK : C_DIM);
 
-  // QR: dolaczenie do sieci albo adres strony
-  String qr;
-  if (qrShowsUrl) {
-    qr = "http://" + (staState == STA_OK ? WiFi.localIP().toString() : AP_IP.toString()) + "/";
-  } else {
-    qr = "WIFI:T:WPA;S:" + apSsid + ";P:" + apPass + ";;";
-  }
-  canvas.fillRoundRect(134, 16, 104, 104, 4, TFT_WHITE);
-  canvas.qrcode(qr.c_str(), 137, 19, 98);
+  // QR: dolaczenie do sieci Cardputera albo adres strony
+  canvas.fillRoundRect(134, 16, 104, 104, 4, qr.isEmpty() ? C_PANEL : TFT_WHITE);
   canvas.setTextDatum(top_center);
   canvas.setTextColor(C_DIM);
-  canvas.drawString(qrShowsUrl ? "QR: strona" : "QR: polacz z siecia", 186, 3);
+  if (qr.isEmpty()) {
+    canvas.drawString("brak IP", 186, 64);
+  } else {
+    canvas.qrcode(qr.c_str(), 137, 19, 98);
+    canvas.drawString(qr.startsWith("WIFI") ? "QR: polacz z siecia" : "QR: strona", 186, 3);
+  }
+}
+
+// wybor istniejacej sieci: skan / lista / haslo
+static void drawNetUi() {
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(top_left);
+  if (netUi == NU_SCAN) {
+    canvas.setTextColor(C_IDLE);
+    canvas.drawString("skanowanie sieci...", 4, 24);
+    return;
+  }
+  if (netUi == NU_LIST) {
+    if (scanNets.empty()) {
+      canvas.setTextColor(scanFailed ? C_BAD : C_DIM);
+      canvas.drawString(scanFailed ? "blad skanowania" : "nie znaleziono sieci", 4, 24);
+      canvas.setTextColor(C_DIM);
+      canvas.drawString("r - skanuj ponownie", 4, 36);
+      canvas.drawString("Cardputer widzi tylko sieci 2.4 GHz", 4, 56);
+      canvas.drawString("(5 GHz nie pojawi sie na liscie).", 4, 66);
+      return;
+    }
+    const int top = scanSel < LIST_ROWS ? 0 : scanSel - LIST_ROWS + 1;
+    for (int r = 0; r < LIST_ROWS && top + r < (int)scanNets.size(); r++) {
+      const int k = top + r, y = 17 + r * 12;
+      const ScanNet &e = scanNets[k];
+      const bool sel = k == scanSel;
+      if (sel) canvas.fillRoundRect(2, y - 1, 236, 11, 2, C_ACCENT);
+      canvas.setTextDatum(top_left);
+      canvas.setTextColor(sel ? C_BG : (e.ssid == staSsid ? C_OK : C_TEXT));
+      canvas.drawString(e.ssid.substring(0, 28), 6, y + 1);
+      canvas.setTextDatum(top_right);
+      canvas.setTextColor(sel ? C_BG : C_DIM);
+      canvas.drawString(String(e.open ? "" : "* ") + e.rssi, 234, y + 1);
+    }
+    return;
+  }
+  // NU_PASS
+  const ScanNet &e = scanNets[scanSel];
+  canvas.setTextColor(C_DIM);
+  canvas.drawString("Siec", 4, 20);
+  canvas.setTextColor(C_TEXT);
+  canvas.drawString(e.ssid.substring(0, 32), 40, 20);
+  canvas.setTextColor(C_DIM);
+  canvas.drawString("Haslo (wpisz z klawiatury):", 4, 38);
+  canvas.fillRoundRect(2, 50, 236, 36, 3, C_PANEL);
+  canvas.setTextColor(C_TEXT);
+  constexpr int PER_LINE = 38;
+  const String shown = passEdit + "_";
+  for (int l = 0; l * PER_LINE < (int)shown.length() && l < 3; l++)
+    canvas.drawString(shown.substring(l * PER_LINE, (l + 1) * PER_LINE), 6, 53 + l * 11);
+  canvas.setTextColor(C_DIM);
+  canvas.drawString("Po polaczeniu Cardputer przejdzie", 4, 94);
+  canvas.drawString("w tryb \"istniejaca siec\".", 4, 104);
+}
+
+// naglowek + tresc + stopka ekranu pomocniczego
+static void drawScreen(const char *title, const char *badge, uint16_t badgeCol, void (*body)(), const char *footer) {
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(C_TEXT);
+  canvas.drawString(title, 4, 3);
+  if (badge) {
+    canvas.setTextColor(badgeCol);
+    canvas.drawString(badge, 8 + canvas.textWidth(title), 3);
+  }
+  canvas.drawFastHLine(0, 13, 240, C_TRACK);
+  body();
+  canvas.fillRect(0, 125, 240, 10, C_PANEL);
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(C_DIM);
+  canvas.drawString(footer, 2, 126);
+  canvas.pushSprite(0, 0);
+  dirty = false;
 }
 
 static void draw() {
   canvas.fillSprite(C_BG);
 
   if (pinScreen) {
-    canvas.setFont(&fonts::Font0);
-    canvas.setTextDatum(top_left);
-    canvas.setTextColor(C_TEXT);
-    canvas.drawString("KONFIGURACJA PINOW", 4, 3);
-    canvas.drawFastHLine(0, 13, 240, C_TRACK);
-    drawPinScreen();
-    canvas.fillRect(0, 125, 240, 10, C_PANEL);
-    canvas.setFont(&fonts::Font0);
-    canvas.setTextDatum(top_left);
-    canvas.setTextColor(C_DIM);
-    canvas.drawString(";. serwo  ,/ pin  ENT zapisz  ESC", 2, 126);
-    canvas.pushSprite(0, 0);
-    dirty = false;
+    drawScreen("KONFIGURACJA PINOW", nullptr, 0, drawPinScreen, ";. serwo  ,/ pin  ENT zapisz  ESC");
+    return;
+  }
+
+  if (netUi != NU_NONE) {
+    drawScreen("WYBOR SIECI", nullptr, 0, drawNetUi,
+               netUi == NU_PASS ? "ENT polacz  DEL usun  ESC wroc"
+                                : ";. wybor  ENT dalej  r skanuj  ESC");
     return;
   }
 
   if (wifiScreen) {
-    canvas.setFont(&fonts::Font0);
-    canvas.setTextDatum(top_left);
-    canvas.setTextColor(C_TEXT);
-    canvas.drawString("WI-FI", 4, 3);
-    canvas.setTextColor(wifiOn ? C_OK : C_BAD);
-    canvas.drawString(wifiOn ? "ON" : "OFF", 38, 3);
-    canvas.drawFastHLine(0, 13, 240, C_TRACK);
-    drawWifiScreen();
-    canvas.fillRect(0, 125, 240, 10, C_PANEL);
-    canvas.setFont(&fonts::Font0);
-    canvas.setTextDatum(top_left);
-    canvas.setTextColor(C_DIM);
-    canvas.drawString(wifiOn ? "ENT wylacz  q QR  r ponow  ESC" : "ENT wlacz  ESC/w wroc", 2, 126);
-    canvas.pushSprite(0, 0);
-    dirty = false;
+    drawScreen("WI-FI", wifiOn ? "ON" : "OFF", wifiOn ? C_OK : C_BAD, drawWifiScreen,
+               wifiOn ? "ENT wyl m tryb n siec q QR r ESC" : "ENT wlacz  m tryb  n siec  ESC");
     return;
   }
 
@@ -818,6 +1156,12 @@ static bool handleWifiKey(char k) {
   switch (k) {
     case 'q': qrShowsUrl = !qrShowsUrl; break;
     case 'r': if (wifiOn) staConnect(); break;
+    case 'm':
+      // tryb "istniejaca siec" bez wybranej sieci -> najpierw wybor sieci
+      if (netMode == NET_AP && staSsid.isEmpty()) startScan();
+      else setNetMode(netMode == NET_AP ? NET_STA : NET_AP);
+      break;
+    case 'n': startScan(); break;
     case '`':
     case 'w': wifiScreen = false; break;
     default: return false;
@@ -826,7 +1170,45 @@ static bool handleWifiKey(char k) {
   return false;
 }
 
+// lista sieci (wpisywanie hasla obsluguje handleKeyboard)
+static void handleNetListKey(char k) {
+  if (netUi != NU_LIST) {
+    if (k == '`') closeNetUi();
+    return;
+  }
+  const int n = scanNets.size();
+  switch (k) {
+    case ';': if (n) scanSel = (scanSel + n - 1) % n; break;
+    case '.': if (n) scanSel = (scanSel + 1) % n; break;
+    case 'r': startScan(); break;
+    case '`': closeNetUi(); break;
+    default: return;
+  }
+  dirty = true;
+}
+
+static void handlePassInput(const Keyboard_Class::KeysState &st) {
+  if (st.enter) {
+    joinNetwork(scanNets[scanSel].ssid, passEdit);
+    return;
+  }
+  if (st.del && passEdit.length()) passEdit.remove(passEdit.length() - 1);
+  for (char c : st.word) {
+    if (c == '`') {  // ESC - wroc do listy
+      netUi = NU_LIST;
+      break;
+    }
+    if (passEdit.length() < 63) passEdit += c;
+  }
+  dirty = true;
+}
+
 static bool handleKey(char k, bool repeat) {
+  if (netUi != NU_NONE) {
+    const bool nav = k == ';' || k == '.';  // przewijanie listy mozna przytrzymac
+    if (!repeat || nav) handleNetListKey(k);
+    return nav;
+  }
   if (pinScreen) return repeat ? false : handlePinKey(k);
   if (wifiScreen) return repeat ? false : handleWifiKey(k);
   switch (k) {
@@ -845,6 +1227,9 @@ static bool handleKey(char k, bool repeat) {
     case '9': setActive(180); break;
     case 'l': linked = !linked; break;
     case 'd': demo = !demo; break;
+    case 't': setServoType(selected, !cont[selected]); break;
+    case '[': if (cont[selected]) setTrim(selected, trimUs[selected] - TRIM_STEP_US); break;
+    case ']': if (cont[selected]) setTrim(selected, trimUs[selected] + TRIM_STEP_US); break;
     case 'h': showHelp = !showHelp; break;
     case 'p': openPinMode(); break;
     case 'w':
@@ -873,11 +1258,20 @@ static void handleKeyboard() {
     heldKey = 0;
     if (kb.isPressed()) {
       auto st = kb.keysState();
+      if (netUi == NU_PASS) {
+        handlePassInput(st);
+        return;
+      }
+      if (netUi == NU_LIST && st.enter) {
+        pickNetwork();
+        return;
+      }
       if (pinScreen && st.enter) {
         closePinMode(true);
         dirty = true;
       } else if (wifiScreen && st.enter) {
         setWifi(!wifiOn);
+        if (wifiOn && netMode == NET_STA && staSsid.isEmpty()) startScan();
       } else if (st.tab && !wifiScreen) {
         if (pinScreen) pinRow ^= 1;
         else selected ^= 1;
