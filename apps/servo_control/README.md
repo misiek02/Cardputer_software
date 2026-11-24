@@ -46,10 +46,40 @@ Sterowanie na ekranie pinów: `;` `.` / `TAB` – wybór serwa, `,` `/` – zmia
 | `d` | demo: ruch tam i z powrotem |
 | `x` | włącz/wyłącz PWM (serwa przestają trzymać pozycję) |
 | `p` | konfiguracja pinów |
+| `w` | Wi-Fi / sterowanie przez przeglądarkę |
 | `h` | pomoc na ekranie |
 
 Ekran pokazuje symulację obu serw: orczyk obraca się z prędkością zbliżoną do
 prawdziwego SG90 (~0,1 s / 60°), biała kropka to kąt docelowy.
+
+## Sterowanie przez sieć (telefon, tablet, komputer)
+
+1. Na Cardputerze naciśnij `w`, potem `ENTER` – włącza Wi-Fi (stan zapamiętywany,
+   po restarcie Wi-Fi włączy się samo).
+2. Cardputer tworzy własną sieć **ServoCtl-XXXX**; hasło (losowe, stałe dla
+   urządzenia) widać na ekranie. Telefonem zeskanuj kod QR – połączy się z siecią.
+3. Telefon zwykle sam otworzy stronę sterowania (captive portal). Jeśli nie –
+   wejdź na **http://192.168.4.1/** (klawisz `q` przełącza QR na adres strony).
+
+Na stronie:
+
+- **dotyk** – przeciągnij palcem po tarczy, każdy palec steruje swoim serwem
+  (dwa kciuki = dwa serwa naraz); przyciski 0° / − / 90° / + / 180°,
+- **mysz** – przeciąganie po tarczy, kółko myszy ±1° (z `Shift` ±krok),
+- **klawiatura** – te same klawisze co na Cardputerze (`1` `2` `Tab`, strzałki
+  lub `,` `/`, `↑` `↓` lub `;` `.` krok, `c`, `0`, `9`, `l`, `d`, `x`),
+- link, demo, PWM on/off, krok oraz zmiana pinów (Ustawienia).
+
+Stan jest wspólny: zmiany z klawiatury Cardputera i z kilku przeglądarek naraz
+widać wszędzie na bieżąco (WebSocket, port 81).
+
+**Sieć domowa (opcjonalnie):** w Ustawieniach na stronie wpisz SSID i hasło.
+Cardputer dalej trzyma własną sieć, a dodatkowo łączy się z domową – jego adres
+pokazuje ekran `w` (lub http://servo.local/). Gdy połączenie się nie uda w 15 s,
+przestaje próbować (`r` na ekranie Wi-Fi ponawia).
+
+Wi-Fi zwiększa pobór prądu – jeśli Cardputer resetuje się przy ruchu serw,
+zasil serwa z zewnętrznego 5V.
 
 ## Build
 

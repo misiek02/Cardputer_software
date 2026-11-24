@@ -20,13 +20,25 @@
 //   d           tryb demo (sweep tam i z powrotem)
 //   x           wlacz/wylacz sygnal PWM
 //   p           konfiguracja pinow
+//   w           Wi-Fi: sterowanie z telefonu / komputera przez przegladarke
 //   h           pomoc
+//
+// Sterowanie przez siec: Cardputer tworzy wlasna siec "ServoCtl-XXXX" (haslo na
+// ekranie Wi-Fi, jest tez kod QR) i serwuje strone http://192.168.4.1/.
+// Opcjonalnie laczy sie tez z siecia domowa (SSID/haslo ustawiasz na stronie).
+// Strona: src/web_ui.h, komendy WebSocket: handleNetCmd().
 
 #include <M5Cardputer.h>
 #include <Preferences.h>
 #include <driver/gpio.h>
 #include <driver/ledc.h>
 #include <math.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
+#include <WebSocketsServer.h>
+#include "web_ui.h"
 
 // ---------- konfiguracja ----------
 // Piny, ktore mozna przypisac serwom. Pominiete: G8/G9 (wewn. I2C klawiatury).
@@ -76,6 +88,22 @@ static int pinRow = 0;
 
 static Preferences prefs;
 static bool dirty = true;
+
+// siec
+enum StaState { STA_NONE, STA_CONNECTING, STA_OK, STA_FAIL };
+static bool wifiOn = false;
+static bool wifiScreen = false;
+static bool qrShowsUrl = false;
+static String apSsid, apPass, staSsid, staPass;
+static StaState staState = STA_NONE;
+static uint32_t staStart = 0;
+static constexpr uint32_t STA_TIMEOUT_MS = 15000;
+static constexpr uint32_t NET_STATE_MS = 40;  // max ~25 aktualizacji/s do przegladarek
+static const IPAddress AP_IP(192, 168, 4, 1);
+static WebServer http(80);
+static WebSocketsServer wsrv(81);
+static DNSServer dns;
+static bool forceBroadcast = false;
 
 static M5Canvas canvas(&M5Cardputer.Display);
 
@@ -172,6 +200,8 @@ static void applyPins(const int newIdx[2]) {
   }
 }
 
+static void closePinMode(bool save);
+
 static void setAngle(int i, int deg) {
   deg = constrain(deg, 0, 180);
   if (deg == target[i]) return;
@@ -207,6 +237,230 @@ static void updateSim(float dt) {
     const float step = SIM_SPEED_DPS * dt;
     simPos[i] = fabsf(diff) <= step ? (float)target[i] : simPos[i] + copysignf(step, diff);
     dirty = true;
+  }
+}
+
+// ---------- siec: Wi-Fi, strona WWW, WebSocket ----------
+static void loadNet() {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "ServoCtl-%04X", (unsigned)(ESP.getEfuseMac() >> 32) & 0xFFFF);
+  apSsid = buf;
+
+  prefs.begin("servoctl", false);
+  wifiOn = prefs.getBool("wifi", false);
+  staSsid = prefs.getString("sta_ssid", "");
+  staPass = prefs.getString("sta_pass", "");
+  apPass = prefs.getString("ap_pass", "");
+  if (apPass.length() < 8) {  // losowe haslo przy pierwszym uruchomieniu
+    snprintf(buf, sizeof(buf), "%08lu", (unsigned long)(esp_random() % 100000000UL));
+    apPass = buf;
+    prefs.putString("ap_pass", apPass);
+  }
+  prefs.end();
+}
+
+static void staConnect() {
+  WiFi.disconnect(false);
+  if (staSsid.isEmpty()) {
+    staState = STA_NONE;
+  } else {
+    WiFi.begin(staSsid.c_str(), staPass.c_str());
+    staState = STA_CONNECTING;
+    staStart = millis();
+  }
+  dirty = true;
+}
+
+static String jsonEscape(const String &in) {
+  String out;
+  for (char c : in) {
+    if (c == '"' || c == '\\') out += '\\';
+    if ((uint8_t)c >= 0x20) out += c;
+  }
+  return out;
+}
+
+static String stateJson() {
+  char buf[128];
+  snprintf(buf, sizeof(buf), "{\"t\":[%d,%d],\"o\":%d,\"l\":%d,\"d\":%d,\"s\":%d,\"k\":%d,\"g\":[%d,%d]}",
+           target[0], target[1], outputOn, linked, demo, selected, stepIdx, PIN_OPTS[pinIdx[0]].gpio,
+           PIN_OPTS[pinIdx[1]].gpio);
+  return buf;
+}
+
+// komendy z przegladarki: "a i deg", "b deg", "s i", "k n", "l 0|1", "d 0|1", "x 0|1", "p g1 g2"
+static void handleNetCmd(const char *msg) {
+  int a = 0, b = 0;
+  const int n = sscanf(msg + 1, "%d %d", &a, &b);
+  switch (msg[0]) {
+    case 'a': {
+      if (n < 2) return;
+      const int i = a & 1, o = i ^ 1;
+      b = constrain(b, 0, 180);
+      demo = false;
+      if (linked) setAngle(o, target[o] + (b - target[i]));  // link: drugie o te sama roznice
+      setAngle(i, b);
+      break;
+    }
+    case 'b':
+      if (n < 1) return;
+      demo = false;
+      setAngle(0, a);
+      setAngle(1, a);
+      break;
+    case 's': selected = a & 1; break;
+    case 'k': stepIdx = constrain(a, 0, NUM_STEPS - 1); break;
+    case 'l': linked = a; break;
+    case 'd': demo = a; break;
+    case 'x':
+      outputOn = a;
+      servoWrite(0);
+      servoWrite(1);
+      break;
+    case 'p': {
+      if (n < 2) return;
+      const int idx[2] = {findPinOpt(a), findPinOpt(b)};
+      if (idx[0] < 0 || idx[1] < 0 || idx[0] == idx[1]) return;
+      applyPins(idx);
+      savePins();
+      if (pinScreen) closePinMode(false);
+      break;
+    }
+    default: return;
+  }
+  dirty = true;
+}
+
+static void onWsEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t len) {
+  switch (type) {
+    case WStype_CONNECTED:
+      forceBroadcast = true;
+      dirty = true;
+      break;
+    case WStype_DISCONNECTED: dirty = true; break;
+    case WStype_TEXT: {
+      char buf[32];
+      len = min(len, sizeof(buf) - 1);
+      memcpy(buf, payload, len);
+      buf[len] = 0;
+      handleNetCmd(buf);
+      break;
+    }
+    default: break;
+  }
+}
+
+static void sendInfo() {
+  String j = "{\"ap\":\"" + apSsid + "\",\"ssid\":\"" + jsonEscape(staSsid) + "\",\"sta\":" + String((int)staState) +
+             ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"pins\":[";
+  for (int k = 0; k < NUM_PIN_OPTS; k++) {
+    if (k) j += ',';
+    j += "[" + String(PIN_OPTS[k].gpio) + ",\"" + PIN_OPTS[k].where + "\"," + (PIN_OPTS[k].sdBus ? "1" : "0") + "]";
+  }
+  j += "]}";
+  http.send(200, "application/json", j);
+}
+
+static void setupRoutes() {
+  http.on("/", HTTP_GET, [] {
+    http.sendHeader("Cache-Control", "no-cache");
+    http.send_P(200, "text/html; charset=utf-8", WEB_UI);
+  });
+  http.on("/info", HTTP_GET, sendInfo);
+  http.on("/wifi", HTTP_POST, [] {
+    staSsid = http.arg("ssid");
+    staPass = http.arg("pass");
+    prefs.begin("servoctl", false);
+    prefs.putString("sta_ssid", staSsid);
+    prefs.putString("sta_pass", staPass);
+    prefs.end();
+    http.send(200, "text/plain", "ok");
+    staConnect();
+  });
+  // "captive portal": telefon podlaczony do sieci Cardputera sam otwiera strone sterowania
+  http.onNotFound([] {
+    if (http.client().localIP() == AP_IP && http.hostHeader() != AP_IP.toString()) {
+      http.sendHeader("Location", "http://192.168.4.1/", true);
+      http.send(302, "text/plain", "");
+    } else {
+      http.send(404, "text/plain", "not found");
+    }
+  });
+}
+
+static void wifiStart() {
+  static bool routes = false;
+  if (!routes) {
+    setupRoutes();
+    wsrv.onEvent(onWsEvent);
+    routes = true;
+  }
+  WiFi.persistent(false);  // dane sieci trzymamy sami w Preferences
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);    // mniejsze opoznienia sterowania
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(apSsid.c_str(), apPass.c_str());
+  dns.start(53, "*", AP_IP);
+  http.begin();
+  wsrv.begin();
+  if (MDNS.begin("servo")) MDNS.addService("http", "tcp", 80);
+  staConnect();
+  wifiOn = true;
+}
+
+static void wifiStop() {
+  wsrv.close();
+  http.stop();
+  dns.stop();
+  MDNS.end();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  staState = STA_NONE;
+  wifiOn = false;
+}
+
+static void setWifi(bool on) {
+  if (on == wifiOn) return;
+  on ? wifiStart() : wifiStop();
+  prefs.begin("servoctl", false);
+  prefs.putBool("wifi", wifiOn);
+  prefs.end();
+  dirty = true;
+}
+
+static void netLoop() {
+  if (!wifiOn) return;
+  dns.processNextRequest();
+  http.handleClient();
+  wsrv.loop();
+
+  const uint32_t now = millis();
+  const bool up = WiFi.status() == WL_CONNECTED;
+  if (staState == STA_CONNECTING && up) {
+    staState = STA_OK;
+    dirty = true;
+  } else if (staState == STA_CONNECTING && now - staStart > STA_TIMEOUT_MS) {
+    staState = STA_FAIL;  // przestajemy probowac - ciagle skanowanie zakloca siec Cardputera
+    WiFi.disconnect(false);
+    dirty = true;
+  } else if (staState == STA_OK && !up) {
+    staState = STA_CONNECTING;
+    staStart = now;
+    dirty = true;
+  }
+
+  // stan do przegladarek tylko gdy sie zmienil (lub ktos sie podlaczyl)
+  static uint32_t lastSent = 0;
+  static String lastJson;
+  if (now - lastSent >= NET_STATE_MS) {
+    lastSent = now;
+    String j = stateJson();
+    if (forceBroadcast || j != lastJson) {
+      wsrv.broadcastTXT(j);
+      lastJson = j;
+      forceBroadcast = false;
+    }
   }
 }
 
@@ -294,15 +548,16 @@ static void drawHelp() {
       {"; .", "krok wiekszy/mniejszy"}, {"c", "oba na 90"},
       {"0 9", "0 / 180 stopni"},      {"l", "link: oba razem"},
       {"d", "demo (sweep)"},          {"x", "PWM on/off"},
-      {"p", "konfiguracja pinow"},    {"h", "zamknij pomoc"},
+      {"p", "konfiguracja pinow"},    {"w", "Wi-Fi / sterowanie WWW"},
+      {"h", "zamknij pomoc"},
   };
-  int y = 13;
+  int y = 12;
   for (auto &l : lines) {
     canvas.setTextColor(C_ACCENT);
     canvas.drawString(l[0], 16, y);
     canvas.setTextColor(C_TEXT);
     canvas.drawString(l[1], 78, y);
-    y += 11;
+    y += 10;
   }
 }
 
@@ -390,6 +645,56 @@ static void drawPinScreen() {
   for (int k = 0; k < 4; k++) drawPinCell(126 + k * 27, 113, 26, GR[k], GRG[k]);
 }
 
+static void drawWifiScreen() {
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(top_left);
+  int y = 18;
+  auto line = [&](const String &txt, uint16_t col, int gap = 10) {
+    canvas.setTextColor(col);
+    canvas.drawString(txt, 4, y);
+    y += gap;
+  };
+
+  if (!wifiOn) {
+    line("Wi-Fi wylaczone.", C_TEXT, 16);
+    line("Po wlaczeniu Cardputer tworzy", C_DIM);
+    line("wlasna siec i strone WWW.", C_DIM);
+    line("Serwami sterujesz wtedy z", C_DIM);
+    line("telefonu, tabletu lub komputera", C_DIM);
+    line("w przegladarce (dotyk, mysz,", C_DIM);
+    line("klawiatura).", C_DIM, 16);
+    line("ENTER - wlacz Wi-Fi", C_ACCENT);
+    return;
+  }
+
+  line("Siec Cardputera", C_DIM);
+  line(apSsid, C_TEXT);
+  line("haslo " + apPass, C_TEXT);
+  line(AP_IP.toString(), C_ACCENT, 14);
+  line("Siec domowa", C_DIM);
+  switch (staState) {
+    case STA_NONE: line("ustaw na stronie", C_DIM); line("(Ustawienia)", C_DIM); break;
+    case STA_CONNECTING: line(staSsid.substring(0, 21), C_TEXT); line("laczenie...", C_IDLE); break;
+    case STA_OK: line(staSsid.substring(0, 21), C_TEXT); line(WiFi.localIP().toString(), C_OK); break;
+    case STA_FAIL: line(staSsid.substring(0, 21), C_TEXT); line("brak polaczenia (r)", C_BAD); break;
+  }
+  y += 4;
+  line("przegladarki: " + String(wsrv.connectedClients()), wsrv.connectedClients() ? C_OK : C_DIM);
+
+  // QR: dolaczenie do sieci albo adres strony
+  String qr;
+  if (qrShowsUrl) {
+    qr = "http://" + (staState == STA_OK ? WiFi.localIP().toString() : AP_IP.toString()) + "/";
+  } else {
+    qr = "WIFI:T:WPA;S:" + apSsid + ";P:" + apPass + ";;";
+  }
+  canvas.fillRoundRect(134, 16, 104, 104, 4, TFT_WHITE);
+  canvas.qrcode(qr.c_str(), 137, 19, 98);
+  canvas.setTextDatum(top_center);
+  canvas.setTextColor(C_DIM);
+  canvas.drawString(qrShowsUrl ? "QR: strona" : "QR: polacz z siecia", 186, 3);
+}
+
 static void draw() {
   canvas.fillSprite(C_BG);
 
@@ -410,6 +715,25 @@ static void draw() {
     return;
   }
 
+  if (wifiScreen) {
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(C_TEXT);
+    canvas.drawString("WI-FI", 4, 3);
+    canvas.setTextColor(wifiOn ? C_OK : C_BAD);
+    canvas.drawString(wifiOn ? "ON" : "OFF", 38, 3);
+    canvas.drawFastHLine(0, 13, 240, C_TRACK);
+    drawWifiScreen();
+    canvas.fillRect(0, 125, 240, 10, C_PANEL);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(C_DIM);
+    canvas.drawString(wifiOn ? "ENT wylacz  q QR  r ponow  ESC" : "ENT wlacz  ESC/w wroc", 2, 126);
+    canvas.pushSprite(0, 0);
+    dirty = false;
+    return;
+  }
+
   // naglowek
   canvas.setFont(&fonts::Font0);
   canvas.setTextDatum(top_left);
@@ -418,6 +742,11 @@ static void draw() {
   canvas.setTextDatum(top_right);
   canvas.setTextColor(outputOn ? C_OK : C_BAD);
   canvas.drawString(outputOn ? "PWM ON" : "PWM OFF", 236, 3);
+  if (wifiOn) {
+    const int n = wsrv.connectedClients();
+    canvas.setTextColor(n ? C_OK : C_IDLE);
+    canvas.drawString(n ? "WEB " + String(n) : String("WiFi"), 186, 3);
+  }
   canvas.drawFastHLine(0, 13, 240, C_TRACK);
 
   drawDial(0, 60);
@@ -485,8 +814,21 @@ static bool handlePinKey(char k) {
   return false;
 }
 
+static bool handleWifiKey(char k) {
+  switch (k) {
+    case 'q': qrShowsUrl = !qrShowsUrl; break;
+    case 'r': if (wifiOn) staConnect(); break;
+    case '`':
+    case 'w': wifiScreen = false; break;
+    default: return false;
+  }
+  dirty = true;
+  return false;
+}
+
 static bool handleKey(char k, bool repeat) {
   if (pinScreen) return repeat ? false : handlePinKey(k);
+  if (wifiScreen) return repeat ? false : handleWifiKey(k);
   switch (k) {
     case ',': moveActive(-STEPS[stepIdx]); return true;
     case '/': moveActive(+STEPS[stepIdx]); return true;
@@ -505,6 +847,10 @@ static bool handleKey(char k, bool repeat) {
     case 'd': demo = !demo; break;
     case 'h': showHelp = !showHelp; break;
     case 'p': openPinMode(); break;
+    case 'w':
+      wifiScreen = true;
+      showHelp = false;
+      break;
     case 'x':
       outputOn = !outputOn;
       servoWrite(0);
@@ -530,7 +876,9 @@ static void handleKeyboard() {
       if (pinScreen && st.enter) {
         closePinMode(true);
         dirty = true;
-      } else if (st.tab) {
+      } else if (wifiScreen && st.enter) {
+        setWifi(!wifiOn);
+      } else if (st.tab && !wifiScreen) {
         if (pinScreen) pinRow ^= 1;
         else selected ^= 1;
         dirty = true;
@@ -576,6 +924,8 @@ void setup() {
 
   loadPins();
   servoSetup();
+  loadNet();
+  if (wifiOn) wifiStart();
   draw();
 }
 
@@ -584,12 +934,18 @@ void loop() {
 
   M5Cardputer.update();
   handleKeyboard();
+  netLoop();
   if (demo) runDemo();
 
   const uint32_t now = millis();
   if (now - lastFrame >= FRAME_MS) {
     updateSim((now - lastFrame) / 1000.0f);
     lastFrame = now;
+    static uint32_t lastWifiDraw = 0;
+    if (wifiScreen && now - lastWifiDraw > 1000) {
+      lastWifiDraw = now;
+      dirty = true;
+    }
     if (dirty) draw();
   }
   delay(2);
